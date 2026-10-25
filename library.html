@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Jin's 자료실</title>
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+  import {
+    getFirestore, collection, addDoc, updateDoc, deleteDoc, doc,
+    onSnapshot, serverTimestamp, query, orderBy
+  } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+  import {
+    getStorage, ref, uploadBytesResumable, getDownloadURL, deleteObject
+  } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-storage.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyDBDYyc4odLU0UvlI1xhtrqh5lD68ZpuJM",
+    authDomain: "jarada-favorites-f663d.firebaseapp.com",
+    projectId: "jarada-favorites-f663d",
+    storageBucket: "jarada-favorites-f663d.firebasestorage.app",
+    messagingSenderId: "623440893632",
+    appId: "1:623440893632:web:f17f87970a2f70493fff25"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const db = getFirestore(app);
+  const storage = getStorage(app);
+  const libCol = collection(db, "library");
+
+  const listEl = document.getElementById("list");
+  const emptyEl = document.getElementById("empty");
+  const errorEl = document.getElementById("error");
+  const fileInput = document.getElementById("fileInput");
+  const dropZone = document.getElementById("dropZone");
+  const uploadsEl = document.getElementById("uploads");
+  const searchInput = document.getElementById("searchInput");
+
+  const MAX_SIZE = 50 * 1024 * 1024; // 50MB
+  let items = []; // {id, name, size, contentType, path, url, createdAt}
+  let editingId = null;
+
+  function showError(msg) {
+    errorEl.textContent = msg;
+    errorEl.style.display = "block";
+  }
+
+  function formatSize(bytes) {
+    if (bytes < 1024) return bytes + " B";
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+    return (bytes / 1024 / 1024).toFixed(1) + " MB";
+  }
+
+  function formatDate(ts) {
+    const d = ts?.toDate?.();
+    if (!d) return "";
+    const p = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}.${p(d.getMonth() + 1)}.${p(d.getDate())}`;
+  }
+
+  function iconFor(item) {
+    const type = item.contentType || "";
+    const ext = (item.name.split(".").pop() || "").toLowerCase();
+    if (type.startsWith("image/")) return "🖼️";
+    if (type.startsWith("video/")) return "🎞️";
+    if (type.startsWith("audio/")) return "🎵";
+    if (ext === "pdf") return "📕";
+    if (["doc", "docx", "hwp", "hwpx"].includes(ext)) return "📄";
+    if (["xls", "xlsx", "csv"].includes(ext)) return "📊";
+    if (["ppt", "pptx"].includes(ext)) return "📽️";
+    if (["zip", "rar", "7z"].includes(ext)) return "🗜️";
+    return "📎";
+  }
+
+  function drawList() {
+    const keyword = searchInput.value.trim().toLowerCase();
+    const shown = items.filter(it => !keyword || it.name.toLowerCase().includes(keyword));
+    listEl.innerHTML = "";
+    emptyEl.style.display = shown.length === 0 ? "block" : "none";
+    emptyEl.textContent = items.length === 0
+      ? "아직 자료가 없어요. 위에서 파일을 올려보세요."
+      : "검색 결과가 없어요.";
+
+    shown.forEach((item) => {
+      const card = document.createElement("div");
+      card.className = "card";
+
+      if (item.id === editingId) {
+        card.classList.add("editing");
+        const editName = document.createElement("input");
+        editName.className = "edit-input";
+        editName.value = item.name;
+        editName.style.flex = "1";
+
+        const saveBtn = document.createElement("button");
+        saveBtn.className = "save-btn";
+        saveBtn.textContent = "저장";
+        saveBtn.onclick = async () => {
+          const name = editName.value.trim();
+          if (!name) return;
+          editingId = null;
+          try {
+            await updateDoc(doc(db, "library", item.id), { name });
+          } catch (err) {
+            showError("수정 오류: " + err.message);
+          }
+        };
+        editName.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") saveBtn.click();
+          if (e.key === "Escape") { editingId = null; drawList(); }
+        });
+
+        const cancelBtn = document.createElement("button");
+        cancelBtn.className = "cancel-btn";
+        cancelBtn.textContent = "취소";
+        cancelBtn.onclick = () => { editingId = null; drawList(); };
+
+        card.appendChild(editName);
+        card.appendChild(saveBtn);
+        card.appendChild(cancelBtn);
+        listEl.appendChild(card);
+        editName.focus();
+        editName.select();
+        return;
+      }
+
+      const link = document.createElement("a");
+      link.href = item.url;
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.className = "card-link";
+
+      const icon = document.createElement("span");
+      icon.className = "file-icon";
+      icon.textContent = iconFor(item);
+
+      const text = document.createElement("div");
+      text.className = "card-text";
+      const nameEl = document.createElement("div");
+      nameEl.className = "card-name";
+      nameEl.textContent = item.name;
+      const metaEl = document.createElement("div");
+      metaEl.className = "card-meta";
+      metaEl.textContent = [formatSize(item.size || 0), formatDate(item.createdAt)].filter(Boolean).join(" · ");
+      text.appendChild(nameEl);
+      text.appendChild(metaEl);
+
+      link.appendChild(icon);
+      link.appendChild(text);
+
+      const actions = document.createElement("div");
+      actions.className = "card-actions";
+
+      const dlBtn = document.createElement("button");
+      dlBtn.className = "icon-btn";
+      dlBtn.title = "다운로드";
+      dlBtn.textContent = "⬇";
+      dlBtn.onclick = () => downloadItem(item);
+
+      const editBtn = document.createElement("button");
+      editBtn.className = "icon-btn";
+      editBtn.title = "이름 수정";
+      editBtn.textContent = "✎";
+      editBtn.onclick = () => { editingId = item.id; drawList(); };
+
+      const delBtn = document.createElement("button");
+      delBtn.className = "icon-btn del-btn";
+      delBtn.title = "삭제";
+      delBtn.textContent = "✕";
+      delBtn.onclick = async () => {
+        if (!confirm(`"${item.name}"을(를) 삭제할까요?`)) return;
+        try {
+          await deleteObject(ref(storage, item.path)).catch((err) => {
+            if (err.code !== "storage/object-not-found") throw err;
+          });
+          await deleteDoc(doc(db, "library", item.id));
+        } catch (err) {
+          showError("삭제 오류: " + err.message);
+        }
+      };
+
+      actions.appendChild(dlBtn);
+      actions.appendChild(editBtn);
+      actions.appendChild(delBtn);
+
+      card.appendChild(link);
+      card.appendChild(actions);
+      listEl.appendChild(card);
+    });
+  }
+
+  async function downloadItem(item) {
+    try {
+      const res = await fetch(item.url);
+      const blob = await res.blob();
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = item.name;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    } catch {
+      // CORS 설정이 없으면 새 탭으로 열어 저장하도록 한다
+      window.open(item.url, "_blank", "noopener");
+    }
+  }
+
+  function uploadFile(file) {
+    if (file.size > MAX_SIZE) {
+      showError(`"${file.name}"은(는) ${formatSize(MAX_SIZE)}를 넘어 올릴 수 없어요.`);
+      return;
+    }
+    const row = document.createElement("div");
+    row.className = "upload-row";
+    const label = document.createElement("div");
+    label.className = "upload-label";
+    label.textContent = file.name;
+    const bar = document.createElement("div");
+    bar.className = "upload-bar";
+    const fill = document.createElement("div");
+    fill.className = "upload-fill";
+    bar.appendChild(fill);
+    row.appendChild(label);
+    row.appendChild(bar);
+    uploadsEl.appendChild(row);
+
+    const path = `library/${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${file.name}`;
+    const task = uploadBytesResumable(ref(storage, path), file, { contentType: file.type || undefined });
+
+    task.on("state_changed",
+      (snap) => { fill.style.width = (snap.bytesTransferred / snap.totalBytes * 100) + "%"; },
+      (err) => {
+        row.remove();
+        showError(`"${file.name}" 업로드 오류: ${err.message}`);
+      },
+      async () => {
+        try {
+          const url = await getDownloadURL(task.snapshot.ref);
+          await addDoc(libCol, {
+            name: file.name,
+            size: file.size,
+            contentType: file.type || "",
+            path,
+            url,
+            createdAt: serverTimestamp()
+          });
+        } catch (err) {
+          showError("저장 오류: " + err.message);
+        }
+        row.remove();
+      }
+    );
+  }
+
+  function handleFiles(fileList) {
+    errorEl.style.display = "none";
+    Array.from(fileList).forEach(uploadFile);
+  }
+
+  fileInput.addEventListener("change", () => {
+    handleFiles(fileInput.files);
+    fileInput.value = "";
+  });
+
+  ["dragenter", "dragover"].forEach(ev => dropZone.addEventListener(ev, (e) => {
+    e.preventDefault();
+    dropZone.classList.add("over");
+  }));
+  ["dragleave", "drop"].forEach(ev => dropZone.addEventListener(ev, (e) => {
+    e.preventDefault();
+    dropZone.classList.remove("over");
+  }));
+  dropZone.addEventListener("drop", (e) => handleFiles(e.dataTransfer.files));
+
+  searchInput.addEventListener("input", drawList);
+
+  const q = query(libCol, orderBy("createdAt", "desc"));
+  onSnapshot(q, (snapshot) => {
+    items = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+    drawList();
+  }, (err) => showError("Firebase 연결 오류: " + err.message));
+</script>
+<style>
+  :root {
+    --navy: #1f2a44;
+    --navy-light: #2d3a5c;
+    --bg: #f4f5f8;
+    --card-bg: #ffffff;
+    --border: #e2e4ea;
+    --text: #1f2937;
+    --text-muted: #8a90a0;
+    --accent: #3b5bdb;
+    --danger: #e03131;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Pretendard", "Malgun Gothic", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 12px 16px 48px;
+  }
+  h1 {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--navy);
+    margin: 0 0 10px;
+    text-align: center;
+  }
+  .nav {
+    max-width: 480px;
+    margin: 0 auto 10px;
+    display: flex;
+    justify-content: center;
+    gap: 6px;
+  }
+  .nav a {
+    font-size: 13px;
+    font-weight: 600;
+    text-decoration: none;
+    color: var(--text-muted);
+    padding: 6px 14px;
+    border-radius: 9px;
+  }
+  .nav a:hover { color: var(--accent); }
+  .nav a.active { background: var(--navy); color: white; }
+  #error {
+    display: none;
+    max-width: 480px;
+    margin: 0 auto 12px;
+    background: #fff5f5;
+    color: var(--danger);
+    border: 1px solid #ffc9c9;
+    border-radius: 10px;
+    padding: 10px 14px;
+    font-size: 13px;
+    word-break: break-all;
+  }
+  #dropZone {
+    max-width: 480px;
+    margin: 0 auto 10px;
+    border: 2px dashed var(--border);
+    background: var(--card-bg);
+    border-radius: 12px;
+    padding: 18px 12px;
+    text-align: center;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+  #dropZone.over { border-color: var(--accent); color: var(--accent); }
+  #dropZone label {
+    display: inline-block;
+    margin-top: 8px;
+    background: var(--navy);
+    color: white;
+    border-radius: 9px;
+    padding: 7px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  #dropZone label:hover { background: var(--navy-light); }
+  #fileInput { display: none; }
+
+  #uploads { max-width: 480px; margin: 0 auto; }
+  .upload-row {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 8px 12px;
+    margin-bottom: 6px;
+  }
+  .upload-label {
+    font-size: 12px;
+    margin-bottom: 6px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .upload-bar { height: 5px; background: #eef0f5; border-radius: 3px; overflow: hidden; }
+  .upload-fill { height: 100%; width: 0; background: var(--accent); transition: width 0.15s; }
+
+  #searchInput {
+    display: block;
+    max-width: 480px;
+    width: 100%;
+    margin: 0 auto 10px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 9px 12px;
+    font-size: 13px;
+    outline: none;
+    background: var(--card-bg);
+  }
+  #searchInput:focus { border-color: var(--accent); }
+
+  #list {
+    max-width: 480px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .card {
+    display: flex;
+    align-items: center;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 4px 4px 4px 2px;
+  }
+  .card.editing { padding: 8px; gap: 6px; }
+  .card-link {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex: 1;
+    min-width: 0;
+    text-decoration: none;
+    color: inherit;
+    padding: 8px;
+  }
+  .file-icon {
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    background: #eef0f5;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 17px;
+    flex-shrink: 0;
+  }
+  .card-text { min-width: 0; }
+  .card-name {
+    font-size: 14px;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .card-meta { font-size: 12px; color: var(--text-muted); }
+  .card-actions { display: flex; flex-shrink: 0; }
+  .icon-btn {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 14px;
+    cursor: pointer;
+    padding: 8px 9px;
+    border-radius: 8px;
+  }
+  .icon-btn:hover { background: #eef0f5; color: var(--accent); }
+  .del-btn:hover { background: #fff0f0; color: var(--danger); }
+
+  .edit-input {
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    padding: 8px 10px;
+    font-size: 14px;
+    outline: none;
+    min-width: 0;
+  }
+  .edit-input:focus { border-color: var(--accent); }
+  .save-btn, .cancel-btn {
+    border: none;
+    border-radius: 9px;
+    padding: 8px 12px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .save-btn { background: var(--navy); color: white; }
+  .save-btn:hover { background: var(--navy-light); }
+  .cancel-btn { background: #eef0f5; color: var(--text); }
+  .cancel-btn:hover { background: #e2e4ea; }
+
+  #empty {
+    display: none;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 14px;
+    margin-top: 40px;
+  }
+</style>
+</head>
+<body>
+  <h1>📚 Jin's 자료실</h1>
+  <div class="nav">
+    <a href="index.html">⭐ 즐겨찾기</a>
+    <a href="library.html" class="active">📚 자료실</a>
+  </div>
+  <div id="error"></div>
+  <div id="dropZone">
+    파일을 여기로 끌어다 놓거나 버튼을 눌러 선택하세요 (최대 50MB)<br>
+    <label for="fileInput">+ 파일 올리기</label>
+    <input id="fileInput" type="file" multiple>
+  </div>
+  <div id="uploads"></div>
+  <input id="searchInput" type="search" placeholder="파일 이름 검색">
+  <div id="list"></div>
+  <div id="empty"></div>
+</body>
+</html>
